@@ -11,6 +11,9 @@ from torch.nn.utils import spectral_norm
 def conv2d(*args, **kwargs):
     return spectral_norm(nn.Conv2d(*args, **kwargs))
 
+def batchNorm2d(*args, **kwargs):
+    return nn.BatchNorm2d(*args, **kwargs)
+
 
 def convTranspose2d(*args, **kwargs):
     return spectral_norm(nn.ConvTranspose2d(*args, **kwargs))
@@ -190,6 +193,25 @@ class DownBlock(nn.Module):
     def forward(self, feat):
         return self.main(feat)
 
+class DownBlockComp(nn.Module):
+    def __init__(self, in_planes, out_planes):
+        super(DownBlockComp, self).__init__()
+
+        self.main = nn.Sequential(
+            conv2d(in_planes, out_planes, 4, 2, 1, bias=False),
+            batchNorm2d(out_planes), nn.LeakyReLU(0.2, inplace=True),
+            conv2d(out_planes, out_planes, 3, 1, 1, bias=False),
+            batchNorm2d(out_planes), nn.LeakyReLU(0.2)
+            )
+
+        self.direct = nn.Sequential(
+            nn.AvgPool2d(2, 2),
+            conv2d(in_planes, out_planes, 1, 1, 0, bias=False),
+            batchNorm2d(out_planes), nn.LeakyReLU(0.2))
+
+    def forward(self, feat):
+        return (self.main(feat) + self.direct(feat)) / 2
+
 
 class DownBlockPatch(nn.Module):
     def __init__(self, in_planes, out_planes, separable=False):
@@ -249,7 +271,6 @@ class FeatureFusionBlock(nn.Module):
 
 
 ### Misc
-
 
 class NoiseInjection(nn.Module):
     def __init__(self):
@@ -323,3 +344,32 @@ class Interpolate(nn.Module):
         )
 
         return x
+
+class SimpleDecoder(nn.Module):
+    """docstring for CAN_SimpleDecoder"""
+    def __init__(self, nfc_in=64, nc=3):
+        super(SimpleDecoder, self).__init__()
+
+        nfc_multi = {4:16, 8:8, 16:4, 32:2, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
+        nfc = {}
+        for k, v in nfc_multi.items():
+            nfc[k] = int(v*32)
+
+        def upBlock(in_planes, out_planes):
+            block = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                conv2d(in_planes, out_planes*2, 3, 1, 1, bias=False),
+                batchNorm2d(out_planes*2), GLU())
+            return block
+
+        self.main = nn.Sequential(  nn.AdaptiveAvgPool2d(8),
+                                    upBlock(nfc_in, nfc[16]) ,
+                                    upBlock(nfc[16], nfc[32]),
+                                    upBlock(nfc[32], nfc[64]),
+                                    upBlock(nfc[64], nfc[128]),
+                                    conv2d(nfc[128], nc, 3, 1, 1, bias=False),
+                                    nn.Tanh() )
+
+    def forward(self, input):
+        # input shape: c x 4 x 4
+        return self.main(input)

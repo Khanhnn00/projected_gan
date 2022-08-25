@@ -295,6 +295,7 @@ def call_func_by_name(*args, func_name: str = None, **kwargs) -> Any:
     assert func_name is not None
     func_obj = get_obj_by_name(func_name)
     assert callable(func_obj)
+    # print(kwargs)
     return func_obj(*args, **kwargs)
 
 
