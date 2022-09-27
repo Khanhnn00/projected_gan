@@ -20,15 +20,16 @@ import legacy
 import shutil
 
 import dnnlib
-from training import training_loop
+from training import training_loop, training_loop_unet, training_loop_mix
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
 from torch_utils import misc
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,3,4'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,5,7'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 
-def subprocess_fn(rank, c, temp_dir):
+def subprocess_fn(rank, c, temp_dir, opts):
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Init torch.distributed.
@@ -48,8 +49,10 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
-
+    if opts.dis == 'unet':
+        training_loop_unet.training_loop(rank=rank, **c)
+    else:
+        training_loop.training_loop(rank=rank, **c)
 
 def launch_training(c, opts, desc, outdir, dry_run):
     dnnlib.util.Logger(should_flush=True)
@@ -113,9 +116,9 @@ def launch_training(c, opts, desc, outdir, dry_run):
     torch.multiprocessing.set_start_method('spawn')
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
-            subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
+            subprocess_fn(opts=opts, rank=0, c=c, temp_dir=temp_dir)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
+            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir, opts), nprocs=c.num_gpus)
 
 
 def init_dataset_kwargs(data):
@@ -142,14 +145,16 @@ def parse_comma_separated_list(s):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['fastgan', 'fastgan_lite', 'stylegan2']), default='stylegan2', required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['fastgan', 'fastgan_lite', 'stylegan2', 'unet']), default='stylegan2', required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',   type=click.IntRange(min=1), required=True)
-@click.option('--projected', type=bool, default=False)                      
-@click.option('--exist', type=bool, default=False)
+@click.option('--dis',          type=click.Choice(['projected', 'unet', 'mix']), default='projected', required=True)                      
+@click.option('--exist',        type=bool, default=False)
 
 # Optional features.
+@click.option('--aug',          help='Augmentation types, should be ada onli lol', metavar='BOOL',                 type=click.Choice([None, 'ada']), default=None, show_default=True)
+@click.option('--augpipe',      default=None)
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
 @click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
@@ -210,6 +215,28 @@ def main(**kwargs):
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
+    # Augmentation pipeline
+    augpipe_specs = {
+        'blit':   dict(xflip=1, rotate90=1, xint=1),
+        'geom':   dict(scale=1, rotate=1, aniso=1, xfrac=1),
+        'color':  dict(brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1),
+        'filter': dict(imgfilter=1),
+        'noise':  dict(noise=1),
+        'cutout': dict(cutout=1),
+        'bg':     dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1),
+        'bgc':    dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1),
+        'bgcf':   dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1),
+        'bgcfn':  dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1, noise=1),
+        'bgcfnc': dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1, imgfilter=1, noise=1, cutout=1),
+    }
+
+    if opts.aug == 'ada':
+        assert opts.augpipe is None or isinstance(opts.augpipe, str)
+        if opts.augpipe == None:
+            opts.augpipe = 'bgc'
+        c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', **augpipe_specs[opts.augpipe])
+    else:
+        c.augment_kwargs = None
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:
         raise click.ClickException('--batch must be a multiple of --gpus')
@@ -224,6 +251,11 @@ def main(**kwargs):
         c.G_kwargs.class_name = 'pg_modules.networks_stylegan2.Generator'
         c.G_kwargs.fused_modconv_default = 'inference_only' # Speed up training by using regular convolutions instead of grouped convolutions.
         use_separable_discs = True
+
+    elif opts.cfg in ['unet']:
+        c.G_kwargs = dnnlib.EasyDict(class_name='pg_modules.network_unet.Generator', cond=opts.cond, synthesis_kwargs=dnnlib.EasyDict())
+        c.G_opt_kwargs.lr = 5e-5
+        c.D_opt_kwargs.lr = 0.0002
 
     elif opts.cfg in ['fastgan', 'fastgan_lite']:
         c.G_kwargs = dnnlib.EasyDict(class_name='pg_modules.networks_fastgan.Generator', cond=opts.cond, synthesis_kwargs=dnnlib.EasyDict())
@@ -247,19 +279,40 @@ def main(**kwargs):
         c.cudnn_benchmark = False
 
     # Description string.
-    is_projected = 'True' if opts.projected else 'False'
-    desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-projected{is_projected:s}'
+    cfg_disc = opts.dis
+    desc = f'{opts.cfg:s}-{cfg_disc:s}-{opts.aug if opts.aug is not None else "None":s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
     # Projected and Multi-Scale Discriminators
-    if opts.projected:
+    if opts.dis == 'projected':
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedGANLoss')
         c.D_kwargs = dnnlib.EasyDict(
             class_name='pg_modules.discriminator.ProjectedDiscriminator',
             diffaug=True,
             interp224=(c.training_set_kwargs.resolution < 224),
             backbone_kwargs=dnnlib.EasyDict(),
+        )
+        c.D_kwargs.backbone_kwargs.cout = 64
+        c.D_kwargs.backbone_kwargs.expand = True
+        c.D_kwargs.backbone_kwargs.proj_type = 2
+        c.D_kwargs.backbone_kwargs.num_discs = 4
+        c.D_kwargs.backbone_kwargs.separable = use_separable_discs
+        c.D_kwargs.backbone_kwargs.cond = opts.cond
+    elif opts.dis == 'unet':
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.UNetLoss')
+        c.D_kwargs = dnnlib.EasyDict(
+            class_name='pg_modules.discriminator.UNetDiscriminator'
+        )
+
+    elif opts.dis == 'mix':
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.MixLoss')
+        c.D_kwargs = dnnlib.EasyDict(
+            class_name='pg_modules.discriminator.MixDiscriminator',
+            diffaug=True,
+            interp224=(c.training_set_kwargs.resolution < 224),
+            backbone_kwargs=dnnlib.EasyDict(),
+            D_mixed_precision = True if not opts.fp32 else False,
         )
         c.D_kwargs.backbone_kwargs.cout = 64
         c.D_kwargs.backbone_kwargs.expand = True

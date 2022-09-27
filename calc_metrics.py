@@ -101,7 +101,7 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
 
     \b
     # Previous training run: look up options automatically, save result to JSONL file.
-    python calc_metrics.py --metrics=eqt50k_int,eqr50k \\
+    python calc_metrics.py --metrics=fid50k_full,pr50k3_full \\
         --network=~/training-runs/00000-stylegan3-r-mydataset/network-snapshot-000000.pkl
 
     \b

@@ -121,10 +121,22 @@ def FPN101():
     return FPN(Bottleneck, [2,2,2,2])
 
 
-def test():
-    net = FPN101()
-    fms = net(Variable(torch.randn(1,3,256,256)))
-    for fm in fms:
-        print(fm.size())
+# import lpips
+# percept1 = lpips.LPIPS(net='vgg')
+# percept2 = lpips.LPIPS(lpips=True, net='vgg', spatial=False, verbose=False)
+# def test():
+#     # net = FPN101()
+#     # fms = net(Variable(torch.randn(256,3,256,256)))
+#     # for fm in fms:
+#     #     print(fm.size())
+#     img1 = torch.randn(16,3,256,256)
+#     img1.requires_grad = True
+#     img2 = torch.randn(16,3,256,256)
+#     img2.requires_grad = True
+#     print(percept1(img1, img2).mean())
+    
+#     for param in percept2.parameters():
+#         param.requires_grad = False
+#     print(percept2(img1, img2).mean())
 
-test()
+# test()

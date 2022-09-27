@@ -361,7 +361,7 @@ def training_loop(
 
             if phase.name in ['Dmain', 'Dboth', 'Dreg']:
                 try:
-                    phase.module.proj.feature_network.requires_grad_(False)
+                    phase.module.feature_network.requires_grad_(False)
                 except AttributeError:
                     pass
 

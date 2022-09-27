@@ -69,7 +69,7 @@ def is_image_ext(fname: Union[str, Path]) -> bool:
 
 def open_image_folder(source_dir, *, max_images: Optional[int]):
     input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
-
+    # print(input_images)
     # Load labels.
     labels = {}
     meta_fname = os.path.join(source_dir, 'dataset.json')
@@ -82,6 +82,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
                 labels = {}
 
     max_idx = maybe_min(len(input_images), max_images)
+    print(max_idx)
 
     def iterate_images():
         for idx, fname in enumerate(input_images):
@@ -99,6 +100,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
 def open_image_zip(source, *, max_images: Optional[int]):
     with zipfile.ZipFile(source, mode='r') as z:
         input_images = [str(f) for f in sorted(z.namelist()) if is_image_ext(f)]
+        # print(input_images)
 
         # Load labels.
         labels = {}
@@ -111,6 +113,7 @@ def open_image_zip(source, *, max_images: Optional[int]):
                     labels = {}
 
     max_idx = maybe_min(len(input_images), max_images)
+    print(max_idx)
 
     def iterate_images():
         with zipfile.ZipFile(source, mode='r') as z:
@@ -420,6 +423,7 @@ def convert_dataset(
 
         # Transform may drop images.
         if img is None:
+            print('none')
             continue
 
         # Error check to require uniform image attributes across
