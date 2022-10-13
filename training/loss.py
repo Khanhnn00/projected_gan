@@ -9,9 +9,7 @@
 # modified by Axel Sauer for "Projected GANs Converge Faster"
 #
 from imp import is_frozen_package
-import lpips
 import random
-from pg_modules.fpn import FPN101
 from cmath import pi
 import functools
 import sys
@@ -40,7 +38,7 @@ class Loss:
 
 
 class ProjectedGANLoss(Loss):
-    def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, pixel_wise='L1', is_percept=False, **kwargs):
+    def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, pixel_wise='L2', is_percept=False, **kwargs):
         super().__init__()
         self.device = device
         self.G = G
@@ -48,15 +46,28 @@ class ProjectedGANLoss(Loss):
         self.D = D
         self.blur_init_sigma = blur_init_sigma
         self.blur_fade_kimg = blur_fade_kimg
-        self.fpn = FPN101().to(device).requires_grad_(False)
+        self.is_fpn = is_fpn
+        self.pixel_wise = pixel_wise
+        self.is_percept = is_percept
+        self.pixLoss = None
 
+        if self.is_fpn and self.pixel_wise == None:
+            raise Exception("There must be pixel-wise loss to use FPN")
+        
         if pixel_wise == 'L1':
             self.pixLoss = torch.nn.L1Loss()
         elif pixel_wise == 'L2':
             self.pixLoss = torch.nn.MSELoss()
 
+        if is_fpn:
+            from pg_modules.fpn import FPN101
+            self.fpn = FPN101().to(device).requires_grad_(False)
+
         if is_percept:
-            self.percept = percept.to(device)
+            import lpips
+            self.percept = lpips.LPIPS(net='vgg').to(device)
+            for param in self.percept.parameters():
+                param.requires_grad = False
 
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
@@ -93,14 +104,6 @@ class ProjectedGANLoss(Loss):
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
                 loss_Gmain = (-gen_logits).mean()
 
-                # real_fts = self.fpn(real_img)
-                # fake_fts = self.fpn(gen_img)
-                # loss_ft = 0
-                # for (real_ft, fake_ft) in zip(real_fts, fake_fts):
-                #     loss_ft += self.l2_loss(real_ft, fake_ft).mean()
-
-                # loss_Gmain += loss_ft
-
                 # Logging
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
@@ -118,15 +121,19 @@ class ProjectedGANLoss(Loss):
                 loss_Dgen = (F.relu(torch.ones_like(
                     gen_logits) + gen_logits)).mean()
 
-                # real_fts = self.fpn(real_img)
-                # fake_fts = self.fpn(gen_img)
-                # loss_ft = 0
-                # for (real_ft, fake_ft) in zip(real_fts, fake_fts):
-                #     loss_ft += self.l1_loss(real_ft, fake_ft).mean()
+                if self.is_fpn:
 
-                # loss_Dgen += loss_ft
-                # percelt_loss = self.percept(real_img, gen_img).mean()
-                # loss_Dgen += percelt_loss
+                    real_fts = self.fpn(real_img)
+                    fake_fts = self.fpn(gen_img)
+                    loss_ft = 0
+                    for (real_ft, fake_ft) in zip(real_fts, fake_fts):
+                        loss_ft += self.l1_loss(real_ft, fake_ft).mean()
+
+                    loss_Dgen += loss_ft
+
+                if self.is_percept:
+                    percelt_loss = self.percept(real_img, gen_img).mean()
+                    loss_Dgen += percelt_loss
 
                 # Logging
                 training_stats.report('Loss/scores/fake', gen_logits)
@@ -142,16 +149,6 @@ class ProjectedGANLoss(Loss):
                     real_img_tmp, real_c, blur_sigma=blur_sigma)
                 loss_Dreal = (F.relu(torch.ones_like(
                     real_logits) - real_logits)).mean()
-
-                # real_fts = self.fpn(real_img)
-                # fake_fts = self.fpn(gen_img)
-                # loss_ft = 0
-                # for (real_ft, fake_ft) in zip(real_fts, fake_fts):
-                #     loss_ft += self.l1_loss(real_ft, fake_ft).mean()
-
-                # loss_Dreal += loss_ft
-                # percelt_loss = self.percept(real_img, gen_img).mean()
-                # loss_Dreal += percelt_loss
 
                 # Logging
                 training_stats.report('Loss/scores/real', real_logits)
@@ -269,7 +266,8 @@ class UNetLoss(Loss):
                 total.backward()
 
 class MixLoss(Loss):
-    def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, pixel_wise='L1', is_percept=False, **kwargs):
+    def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, \
+                 pixel_wise='L1', is_percept=False, weight_unet=1e-2, **kwargs):
         super().__init__()
         self.device = device
         self.G = G
@@ -280,17 +278,26 @@ class MixLoss(Loss):
         self.is_fpn = is_fpn
         self.pixel_wise = pixel_wise
         self.is_percept = is_percept
+        self.weight_unet = weight_unet
+        # print(is_percept, is_fpn, weight_unet)
 
-        if is_fpn:
-            self.fpn = FPN101().to(device).requires_grad_(False)
-
+        if self.is_fpn and self.pixel_wise == None:
+            raise Exception("There must be pixel-wise loss to use FPN")
+        
         if pixel_wise == 'L1':
             self.pixLoss = torch.nn.L1Loss()
         elif pixel_wise == 'L2':
             self.pixLoss = torch.nn.MSELoss()
 
+        if is_fpn:
+            from pg_modules.fpn import FPN101
+            self.fpn = FPN101().to(device).requires_grad_(False)
+
         if is_percept:
+            import lpips
             self.percept = lpips.LPIPS(net='vgg').to(device)
+            for param in self.percept.parameters():
+                param.requires_grad = False
 
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
@@ -332,7 +339,6 @@ class MixLoss(Loss):
                 loss_Gmain = (-gen_logits).mean()
 
                 # Logging
-                training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
                 training_stats.report('Loss/G/loss', loss_Gmain)
 
@@ -352,6 +358,20 @@ class MixLoss(Loss):
                 loss_Dgen_unet = (F.relu(torch.ones_like(
                     gen_logits_unet) + gen_logits_unet)).mean()
 
+                if self.is_fpn:
+
+                    real_fts = self.fpn(real_img)
+                    fake_fts = self.fpn(gen_img)
+                    loss_ft = 0
+                    for (real_ft, fake_ft) in zip(real_fts, fake_fts):
+                        loss_ft += self.pixLoss(real_ft, fake_ft).mean()
+
+                    loss_Dgen += loss_ft
+
+                if self.is_percept:
+                    percelt_loss = self.percept(real_img, gen_img).mean()
+                    loss_Dgen += percelt_loss
+
                 # Logging
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
@@ -360,8 +380,9 @@ class MixLoss(Loss):
                 training_stats.report('Loss/signs/fake/unet', gen_logits_unet.sign())
 
             with torch.autograd.profiler.record_function('Dgen_backward'):
-                total_dgen = loss_Dgen + 1e-2*loss_Dgen_unet
+                total_dgen = loss_Dgen + self.weight_unet*loss_Dgen_unet
                 total_dgen.backward()
+
             # Dmain: Maximize logits for real images.
             with torch.autograd.profiler.record_function('Dreal_forward'):
                 real_img_tmp = real_img.detach().requires_grad_(False)
@@ -374,6 +395,20 @@ class MixLoss(Loss):
                 loss_Dreal_unet = (F.relu(torch.ones_like(
                     real_logits_unet) - real_logits_unet)).mean()
 
+                if self.is_fpn:
+
+                    real_fts = self.fpn(real_img)
+                    fake_fts = self.fpn(gen_img)
+                    loss_ft = 0
+                    for (real_ft, fake_ft) in zip(real_fts, fake_fts):
+                        loss_ft += self.pixLoss(real_ft, fake_ft).mean()
+
+                    loss_Dreal += loss_ft
+
+                if self.is_percept:
+                    percelt_loss = self.percept(real_img, gen_img).mean()
+                    loss_Dreal += percelt_loss
+
                 # Logging
                 training_stats.report('Loss/scores/real', real_logits)
                 training_stats.report('Loss/signs/real', real_logits.sign())
@@ -384,8 +419,15 @@ class MixLoss(Loss):
                 training_stats.report('Loss/D/loss', loss_Dgen + loss_Dreal + loss_Dgen_unet + loss_Dreal_unet)
 
             with torch.autograd.profiler.record_function('Dreal_backward'):
-                total_dreal = loss_Dreal + 1e-2*loss_Dreal_unet
+                total_dreal = loss_Dreal + self.weight_unet*loss_Dreal_unet
                 total_dreal.backward()
+                
+class ProjectedHungarianLoss(Loss):
+    def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, \
+                 pixel_wise='L1', is_percept=False, **kwargs) -> None:
+        super().__init__()
+        
+
 class FastGANLoss(Loss):
     def __init__(self, device, G, G_ema, D):
         super().__init__()

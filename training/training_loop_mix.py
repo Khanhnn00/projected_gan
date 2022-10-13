@@ -141,11 +141,9 @@ def training_loop(
     training_set_kwargs     = {},       # Options for training set.
     data_loader_kwargs      = {},       # Options for torch.utils.data.DataLoader.
     G_kwargs                = {},       # Options for generator network.
+    D_kwargs                = {},       # Options for discriminator network.
     G_opt_kwargs            = {},       # Options for generator optimizer.
-    D_proj_kwargs           = {},       # Options for discriminator optimizer.
-    D_unet_kwargs           = {},       # Options for discriminator optimizer.
-    D_proj_opt_kwargs       = {},       # Options for discriminator optimizer.
-    D_unet_opt_kwargs       = {},       # Options for discriminator optimizer.
+    D_opt_kwargs            = {},       # Options for discriminator optimizer.
     loss_kwargs             = {},       # Options for loss function.
     metrics                 = [],       # Metrics to evaluate during training.
     augment_kwargs          = None,
@@ -157,8 +155,7 @@ def training_loop(
     ema_kimg                = 10,       # Half-life of the exponential moving average (EMA) of generator weights.
     ema_rampup              = 0.05,     # EMA ramp-up coefficient. None = no rampup.
     G_reg_interval          = None,     # How often to perform regularization for G? None = disable lazy regularization.
-    D_proj_reg_interval     = 16,       # How often to perform regularization for D? None = disable lazy regularization.\
-    D_unet_reg_interval     = None,       # How often to perform regularization for D? None = disable lazy regularization.
+    D_reg_interval          = 16,       # How often to perform regularization for D? None = disable lazy regularization.
     ada_target              = 0.6,     # ADA target value. None = fixed p.
     ada_interval            = 4,        # How often to perform ADA adjustment?
     ada_kimg                = 500,      # ADA adjustment speed, measured in how many kimg it takes for p to increase/decrease by one unit.
@@ -209,8 +206,7 @@ def training_loop(
         print('Constructing networks...')
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-    D_proj = dnnlib.util.construct_class_by_name(**D_proj_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-    D_unet = dnnlib.util.construct_class_by_name(**D_unet_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+    D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
 
     # Check for existing checkpoint
@@ -226,19 +222,30 @@ def training_loop(
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
-        if ckpt_pkl is not None:            # Load ticks
-            __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
-            __CUR_TICK__ = resume_data['progress']['cur_tick'].to(device)
-            __BATCH_IDX__ = resume_data['progress']['batch_idx'].to(device)
-            __PL_MEAN__ = resume_data['progress'].get('pl_mean', torch.zeros([])).to(device)
-            best_fid = resume_data['progress']['best_fid']       # only needed for rank == 0
-
+        # if ckpt_pkl is not None:            # Load ticks
+        print(f'Resuming ckpt from "{resume_pkl}"')
+        __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
+        __CUR_TICK__ = resume_data['progress']['cur_tick'].to(device)
+        __BATCH_IDX__ = resume_data['progress']['batch_idx'].to(device)
+        __PL_MEAN__ = resume_data['progress'].get('pl_mean', torch.zeros([])).to(device)
+        best_fid = resume_data['progress']['best_fid']       # only needed for rank == 0
+        print('Finished loading ticks')
+        print(__CUR_NIMG__.item())
+        print(__CUR_TICK__.item())
         del resume_data
+        # return
+
+        optim_pth = resume_pkl.replace('network-snapshot.pkl', 'optim.pth')
+        print(f'Resuming optimization state from "{optim_pth}"')
+        try:
+            optim_ckp = torch.load(optim_pth)
+        except Exception as e:
+            print(e)
 
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
-        c = torch.empty([batch_gpu], device=device)
+        c = torch.empty([batch_gpu, G.c_dim], device=device)
         img = misc.print_module_summary(G, [z, c])
         misc.print_module_summary(D, [img, c])
 
@@ -256,7 +263,7 @@ def training_loop(
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
 
-    for module in [G, D_proj, D_unet, G_ema, augment_pipe]:
+    for module in [G, D, G_ema, augment_pipe]:
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
@@ -266,9 +273,14 @@ def training_loop(
         print('Setting up training phases...')
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, G_ema=G_ema, D=D, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
-    for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D_proj', D_proj, D_proj_opt_kwargs, D_proj_reg_interval), ('D_unet', D_unet, D_unet_opt_kwargs, D_unet_reg_interval)]:
+    for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
             opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            if (resume_pkl is not None) and (rank == 0):
+                try:
+                    opt.load_state_dict(optim_ckp[name+'both'])
+                except Exception as e:
+                    print(e)
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
         else: # Lazy regularization.
             mb_ratio = reg_interval / (reg_interval + 1)
@@ -276,10 +288,15 @@ def training_loop(
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
             opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            if (resume_pkl is not None) and (rank == 0):
+                try:
+                    opt.load_state_dict(optim_ckp[name+'main'])
+                except Exception as e:
+                    print(e)
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
     for phase in phases:
-        # print(phase, phase.module)
+        # print(phase.name)
         phase.start_event = None
         phase.end_event = None
         if rank == 0:
@@ -365,7 +382,7 @@ def training_loop(
 
             if phase.name in ['Dmain', 'Dboth', 'Dreg']:
                 try:
-                    phase.module.feature_network.requires_grad_(False)
+                    phase.module.proj.feature_network.requires_grad_(False)
                 except AttributeError:
                     pass
 
@@ -456,18 +473,37 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.jpg'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
+        snapshot_optim = {}
+
+        if round(cur_nimg / 1e3) == 10000:
+            snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs))
+            for key, value in snapshot_data.items():
+                if isinstance(value, torch.nn.Module):
+                    snapshot_data[key] = value
+                del value # conserve memory
+            with open('{}/snap_10k.pkl'.format(run_dir), 'wb') as f:
+                pickle.dump(snapshot_data, f)
+            del snapshot_data
+
+        snapshot_data = None
+
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
                 if isinstance(value, torch.nn.Module):
                     snapshot_data[key] = value
                 del value # conserve memory
+                
+            
+            for phase in phases:
+                snapshot_optim[phase.name] = phase.opt.state_dict()
+            torch.save(snapshot_optim, os.path.join(run_dir, 'optim.pth'))
 
         # Save Checkpoint if needed
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (
@@ -548,6 +584,8 @@ def training_loop(
         maintenance_time = tick_start_time - tick_end_time
         if done:
             break
+
+     
 
     # Done.
     if rank == 0:

@@ -527,11 +527,12 @@ class MixDiscriminator(nn.Module):
                  diffaug=True,
                  interp224=True,
                  backbone_kwargs={},
+                 img_resolution=512,
                  D_mixed_precision=True,
                  **kwargs):
         super(MixDiscriminator, self).__init__()
         self.proj = ProjectedDiscriminator(diffaug, interp224, backbone_kwargs, **kwargs)
-        self.unet = UNetDiscriminator(D_ch=64, D_wide=True, img_resolution=256, c_dim=3, img_channels=3,
+        self.unet = UNetDiscriminator(D_ch=64, D_wide=True, img_resolution=img_resolution, c_dim=3, img_channels=3,
                              D_kernel_size=3, D_attn='64', n_classes=0,
                              num_D_SVs=1, num_D_SV_itrs=1, D_activation=nn.ReLU(inplace=False),
                              SN_eps=1e-12, output_dim=1, D_mixed_precision=D_mixed_precision, D_fp16=False,

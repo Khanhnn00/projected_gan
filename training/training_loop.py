@@ -222,14 +222,25 @@ def training_loop(
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
-        if ckpt_pkl is not None:            # Load ticks
-            __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
-            __CUR_TICK__ = resume_data['progress']['cur_tick'].to(device)
-            __BATCH_IDX__ = resume_data['progress']['batch_idx'].to(device)
-            __PL_MEAN__ = resume_data['progress'].get('pl_mean', torch.zeros([])).to(device)
-            best_fid = resume_data['progress']['best_fid']       # only needed for rank == 0
-
+        # if ckpt_pkl is not None:            # Load ticks
+        print(f'Resuming ckpt from "{resume_pkl}"')
+        __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
+        __CUR_TICK__ = resume_data['progress']['cur_tick'].to(device)
+        __BATCH_IDX__ = resume_data['progress']['batch_idx'].to(device)
+        __PL_MEAN__ = resume_data['progress'].get('pl_mean', torch.zeros([])).to(device)
+        best_fid = resume_data['progress']['best_fid']       # only needed for rank == 0
+        print('Finished loading ticks')
+        print(__CUR_NIMG__.item())
+        print(__CUR_TICK__.item())
         del resume_data
+        # return
+
+        optim_pth = resume_pkl.replace('network-snapshot.pkl', 'optim.pth')
+        print(f'Resuming optimization state from "{optim_pth}"')
+        try:
+            optim_ckp = torch.load(optim_pth)
+        except Exception as e:
+            print(e)
 
     # Print network summary tables.
     if rank == 0:
@@ -265,6 +276,11 @@ def training_loop(
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
             opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            if (resume_pkl is not None) and (rank == 0):
+                try:
+                    opt.load_state_dict(optim_ckp[name+'both'])
+                except Exception as e:
+                    print(e)
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
         else: # Lazy regularization.
             mb_ratio = reg_interval / (reg_interval + 1)
@@ -272,10 +288,15 @@ def training_loop(
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
             opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            if (resume_pkl is not None) and (rank == 0):
+                try:
+                    opt.load_state_dict(optim_ckp[name+'main'])
+                except Exception as e:
+                    print(e)
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
     for phase in phases:
-        # print(phase, phase.module)
+        # print(phase.name)
         phase.start_event = None
         phase.end_event = None
         if rank == 0:
@@ -361,7 +382,7 @@ def training_loop(
 
             if phase.name in ['Dmain', 'Dboth', 'Dreg']:
                 try:
-                    phase.module.proj.feature_network.requires_grad_(False)
+                    phase.module.feature_network.requires_grad_(False)
                 except AttributeError:
                     pass
 
@@ -458,12 +479,31 @@ def training_loop(
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
+        snapshot_optim = {}
+
+        if round(cur_nimg / 1e3) == 10000:
+            snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs))
+            for key, value in snapshot_data.items():
+                if isinstance(value, torch.nn.Module):
+                    snapshot_data[key] = value
+                del value # conserve memory
+            with open('{}/snap_10k.pkl'.format(run_dir), 'wb') as f:
+                pickle.dump(snapshot_data, f)
+            del snapshot_data
+
+        snapshot_data = None
+
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
                 if isinstance(value, torch.nn.Module):
                     snapshot_data[key] = value
                 del value # conserve memory
+                
+            
+            for phase in phases:
+                snapshot_optim[phase.name] = phase.opt.state_dict()
+            torch.save(snapshot_optim, os.path.join(run_dir, 'optim.pth'))
 
         # Save Checkpoint if needed
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (
@@ -545,8 +585,7 @@ def training_loop(
         if done:
             break
 
-        
-        
+     
 
     # Done.
     if rank == 0:

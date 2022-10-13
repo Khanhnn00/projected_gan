@@ -26,8 +26,11 @@ from torch_utils import training_stats
 from torch_utils import custom_ops
 from torch_utils import misc
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,5,7'
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,3,4'
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '1,5,6,7'
 
 def subprocess_fn(rank, c, temp_dir, opts):
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
@@ -51,6 +54,8 @@ def subprocess_fn(rank, c, temp_dir, opts):
     # Execute training loop.
     if opts.dis == 'unet':
         training_loop_unet.training_loop(rank=rank, **c)
+    elif opts.dis == 'mix':
+        training_loop_mix.training_loop(rank=rank, **c)
     else:
         training_loop.training_loop(rank=rank, **c)
 
@@ -172,14 +177,18 @@ def parse_comma_separated_list(s):
 @click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--snap_visual',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=30, show_default=True)
-@click.option('--snap_save',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=100, show_default=True)
+@click.option('--snap_visual',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=500, show_default=True)
+@click.option('--snap_save',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 @click.option('--restart_every',help='Time interval in seconds to restart code', metavar='INT', type=int, default=9999999, show_default=True)
+
+@click.option('--is_fpn',     help='Use FPN loss in Discriminator', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--is_percept',     help='Use LPIPS loss in Discriminator', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--weight_unet',     help='Trade-off between unet and projected', metavar='FLOAT', type=float, default=0.2, show_default=True)
 
 
 def main(**kwargs):
@@ -281,6 +290,7 @@ def main(**kwargs):
     # Description string.
     cfg_disc = opts.dis
     desc = f'{opts.cfg:s}-{cfg_disc:s}-{opts.aug if opts.aug is not None else "None":s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
+    desc += f'-fpn{opts.is_fpn:b}-unet{opts.weight_unet:f}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
@@ -306,13 +316,18 @@ def main(**kwargs):
         )
 
     elif opts.dis == 'mix':
-        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.MixLoss')
-        c.D_kwargs = dnnlib.EasyDict(
+        c.loss_kwargs = dnnlib.EasyDict(
+            class_name='training.loss.MixLoss',
+            is_percept = opts.is_percept,
+            is_fpn = opts.is_fpn,
+            weight_unet = opts.weight_unet
+        )
+        c.D_kwargs = dnnlib.EasyDict( 
             class_name='pg_modules.discriminator.MixDiscriminator',
             diffaug=True,
             interp224=(c.training_set_kwargs.resolution < 224),
             backbone_kwargs=dnnlib.EasyDict(),
-            D_mixed_precision = True if not opts.fp32 else False,
+            D_mixed_precision = True if not opts.fp32 else False
         )
         c.D_kwargs.backbone_kwargs.cout = 64
         c.D_kwargs.backbone_kwargs.expand = True
@@ -320,6 +335,7 @@ def main(**kwargs):
         c.D_kwargs.backbone_kwargs.num_discs = 4
         c.D_kwargs.backbone_kwargs.separable = use_separable_discs
         c.D_kwargs.backbone_kwargs.cond = opts.cond
+        # c.D_kwargs.img_resolution = c.training_set_kwargs.resolution
     else:
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.FastGANLoss')
         c.D_kwargs = dnnlib.EasyDict(

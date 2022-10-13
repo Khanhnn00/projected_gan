@@ -10,6 +10,11 @@ data/*
 training-runs/*
 out/*
 
+res/*
+*.pt
+
+*.jpg
+*.png
 
 *.zip
 
