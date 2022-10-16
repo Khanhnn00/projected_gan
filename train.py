@@ -30,7 +30,7 @@ from torch_utils import misc
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,3,4'
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1,5,6,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,6,7'
 
 def subprocess_fn(rank, c, temp_dir, opts):
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
@@ -154,7 +154,7 @@ def parse_comma_separated_list(s):
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',   type=click.IntRange(min=1), required=True)
-@click.option('--dis',          type=click.Choice(['projected', 'unet', 'mix']), default='projected', required=True)                      
+@click.option('--dis',          type=click.Choice(['projected', 'projected_matching', 'unet', 'mix']), default='projected', required=True)                      
 @click.option('--exist',        type=bool, default=False)
 
 # Optional features.
@@ -295,8 +295,11 @@ def main(**kwargs):
         desc += f'-{opts.desc}'
 
     # Projected and Multi-Scale Discriminators
-    if opts.dis == 'projected':
-        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedGANLoss')
+    if opts.dis in ['projected', 'projected_matching']:
+        if opts.dis == 'projected':
+            c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedGANLoss')
+        else:
+            c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedHungarianLoss')
         c.D_kwargs = dnnlib.EasyDict(
             class_name='pg_modules.discriminator.ProjectedDiscriminator',
             diffaug=True,

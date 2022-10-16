@@ -14,60 +14,35 @@ from pg_modules.hungarian import HungarianMatcher
 
 device = 'cuda'
 resize = transforms.Resize(size=(640, 640))
-# model = UNetDiscriminator().to(device)
+bz = 8
 
-# input = torch.randn((2, 3, 256, 256))
-# output = model(input)
-# print(output.shape, output.max(), output.min(), output.mean())
-
-# backbone_kwargs = dnnlib.EasyDict()
-
-# backbone_kwargs.cout = 64
-# backbone_kwargs.expand = True
-# backbone_kwargs.proj_type = 2
-# backbone_kwargs.num_discs = 4
-# backbone_kwargs.separable = False
-# backbone_kwargs.cond = False
-
-# pj_model = ProjectedDiscriminator(backbone_kwargs=backbone_kwargs)
-
-# mix_model = MixDiscriminator(backbone_kwargs=backbone_kwargs,D_mixed_precision=True)
-# out_pj = mix_model.proj(input, label='real')
-# out_unet = mix_model.unet(input)
-
-# print(out_pj.shape)
-# print(out_unet.shape)
-
-path = '/home/ubuntu/test_cityscape'
-img_list = os.listdir(path)
-batch = []
-for i in img_list:
-    img = cv2.imread(os.path.join(path, i))[:, :, ::-1]
-    img = torch.tensor(np.transpose(np.ascontiguousarray(img), (2,0,1))).unsqueeze(0)
-    batch.append(img)
-
-batch = torch.cat(batch, dim=0).to(device).float()
-outputs = predict_img(batch)
-# print(outputs[0])
-# print(res, len(res), len(res[0]))
+ckp_object = '/home/ubuntu/runs/00011-fastgan_lite-mix-ada-cityscape_train_256-gpus4-batch144-fpn0-unet0.200000/network-snapshot.pkl'
+with dnnlib.util.open_url(ckp_object, verbose=True) as f:
+    network_dict = legacy.load_network_pkl(f)
+    G_main = network_dict['G_ema'] # subclass of torch.nn.Module
 
 ckp_object = '/home/ubuntu/run_unet/00022-fastgan_lite-mix-ada-crop_train_256-gpus4-batch144/network-snapshot.pkl'
 with dnnlib.util.open_url(ckp_object, verbose=True) as f:
     network_dict = legacy.load_network_pkl(f)
     G_unet = network_dict['G_ema'] # subclass of torch.nn.Module
     
+G_main = G_main.eval().to(device)
 G_unet = G_unet.eval().to(device)
 
 k= 20
-nsamples = k*len(outputs)
-
-z_unet = torch.randn([nsamples, G_unet.z_dim], device=device)
-objects = G_unet(z_unet, c=0)
+nsamples = k*bz
 lo, hi = -1, 1
-objects = np.asarray(objects.cpu(), dtype=np.float32)
-objects = (objects - lo) * (255 / (hi - lo))
-objects = np.rint(objects).clip(0, 255).astype(np.uint8)
-objects = torch.from_numpy(objects).to(device).float()
+
+z_main = torch.randn([bz, G_unet.z_dim], device=device)
+z_unet = torch.randn([nsamples, G_unet.z_dim], device=device)
+samples = G_main(z_main, c=0).float()
+new_samples = (samples - lo) * (255 / (hi - lo))
+new_samples = torch.clip(new_samples.round(), min=0, max=255)
+
+objects = G_unet(z_unet, c=0)
+outputs = predict_img(new_samples)
+new_objects = (objects - lo) * (255 / (hi - lo))
+new_objects = torch.clip(new_objects.round(), min=0, max=255)
 
 matcher = HungarianMatcher()
 
@@ -76,14 +51,14 @@ print(len(outputs))
 print('**********************')
 for i in range(len(outputs)):
     print(len(outputs[i]))
-    batch[i, :, :, :] = matcher(batch[i], outputs[i], objects[idx:idx+k])
+    samples[i, :, :, :] = matcher(new_samples[i], outputs[i], new_objects[idx:idx+k], samples[i], objects[idx:idx+k])[0]
     idx += k
     
-for i in range(len(img_list)):
-    tmp = batch[i].detach().cpu().numpy()
+for i in range(bz):
+    tmp = samples[i].detach().cpu().numpy()
     tmp = np.transpose(tmp, (1,2,0))[:, :, ::-1]
     tmp = np.ascontiguousarray(tmp)
-    cv2.imwrite(img_list[i], tmp)
+    cv2.imwrite('{}.jpg'.format(i), tmp)
     
     
 

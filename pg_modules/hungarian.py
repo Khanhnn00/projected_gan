@@ -30,7 +30,7 @@ class HungarianMatcher(nn.Module):
 
 
     @torch.no_grad()
-    def forward(self, batch, outputs, targets):
+    def forward(self, batch, targets, org_samples, org_targets, outputs, g_device, g_unet_device):
         """ Performs the matching
 
         Params:
@@ -38,54 +38,61 @@ class HungarianMatcher(nn.Module):
             targets: B 3 H W
 
         Returns:
-            A list of size batch_size, containing tuples of (index_i, index_j) where:
-                - index_i is the indices of the selected predictions (in order)
-                - index_j is the indices of the corresponding selected targets (in order)
-            For each batch element, it holds:
-                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
+
         """
         # assert len(outputs) == targets.shape[0]
 
         # We flatten to compute the cost matrices in a batch
         subTarget = [np.transpose(targets[k].cpu().numpy(), (1,2,0)) for k in range(targets.shape[0])]
+        subOrgTarget = [np.transpose(org_targets[k].cpu().numpy(), (1,2,0)) for k in range(org_targets.shape[0])]
         for ind, pred in enumerate(outputs):
-            pred_bbox, cls = pred[0], pred[1]
-            h, w = abs(pred_bbox[3] - pred_bbox[1]), abs(pred_bbox[2] - pred_bbox[0])
-            tmp_transform = transforms.Resize(size=(int(h), int(w)))
-            cur_idx = -1
-            curLoss = np.iinfo(np.uint32).max
-            curPatch = None
-            for k in range(len(subTarget)):
-                # print(subTarget[k].shape)
-                h, w = subTarget[k].shape[0], subTarget[k].shape[1]
-                mh, mw = h//2, w//2
-                rh, rw = mh, mw
-                # print(subTarget[k][:, :, 0])
-                while subTarget[k][mh][rw][0] != 0 and rw > 0:
-                    # print(subTarget[k][mh][rw][0])
-                    rw -= 1
-                while subTarget[k][rh][mw][0] != 0 and rh > 0:
-                    rh -= 1
-                nh = (mh-rh) * 2
-                nw = (mw-rw) * 2
-                # print(rh, mh, nh)
-                # print(rw, mw, nw)
-                tmp_target = subTarget[k][rh:rh+nh, rw:rw+nw, :]
-                # print(tmp_target.shape)
-                tmp_target = tmp_transform(torch.from_numpy(tmp_target).to(device).permute(2,0,1))
-                tmp = loss(batch[:, int(pred_bbox[1]):int(pred_bbox[3]), \
-                            int(pred_bbox[0]):int(pred_bbox[2])],\
-                            tmp_target)
-                # print(tmp)
-                if tmp.item() < curLoss:
-                    curLoss = tmp
-                    curPatch = tmp_target
-                    cur_idx = k
-            subTarget.pop(cur_idx)
-            batch[:, int(pred_bbox[1]):int(pred_bbox[3]), \
-                            int(pred_bbox[0]):int(pred_bbox[2])] = curPatch
+            if len(subTarget) == 0:
+                pass
+            else:
+                pred_bbox, cls = pred[0], pred[1]
+                h, w = abs(pred_bbox[3] - pred_bbox[1]), abs(pred_bbox[2] - pred_bbox[0])
+                tmp_transform = transforms.Resize(size=(int(h), int(w)))
+                cur_idx = -1
+                curLoss = np.iinfo(np.uint32).max
+                curPatch = None
+                for k in range(len(subTarget)):
+                    # print(subTarget[k].shape)
+                    h, w = subTarget[k].shape[0], subTarget[k].shape[1]
+                    # print(h, w)
+                    mh, mw = h//2, w//2
+                    th = bh = mh
+                    lw = rw = mw
+                    # print(subTarget[k][:, :, 0])
+                    while subTarget[k][mh][rw][0] != 0 and rw < w-1:
+                        rw += 1
+                    while subTarget[k][mh][lw][0] != 0 and lw > 0:
+                        lw -= 1
+                    
+                    while subTarget[k][th][mw][0] != 0 and th < h-1:
+                        th += 1
+                    while subTarget[k][bh][mw][0] != 0 and bh > 0:
+                        bh -= 1
+                    tmp_target = subTarget[k][bh:th+1, lw:rw+1, :]
+                    tmp_org_target = subOrgTarget[k][bh:th+1, lw:rw+1, :]
+                    # print(tmp_target.shape)
+                    tmp_target = tmp_transform(torch.from_numpy(tmp_target).to(g_device).permute(2,0,1))
+                    tmp_org_target = tmp_transform(torch.from_numpy(tmp_org_target).to(g_device).permute(2,0,1))
+                    tmp = loss(batch[:, int(pred_bbox[1]):int(pred_bbox[3]), \
+                                int(pred_bbox[0]):int(pred_bbox[2])],\
+                                tmp_target)
+                    # print(tmp)
+                    if tmp.item() < curLoss:
+                        curLoss = tmp
+                        curPatch = tmp_target
+                        curOrg = tmp_org_target
+                        cur_idx = k
+                subTarget.pop(cur_idx)
+                batch[:, int(pred_bbox[1]):int(pred_bbox[3]), \
+                                int(pred_bbox[0]):int(pred_bbox[2])] = curPatch
+                org_samples[:, int(pred_bbox[1]):int(pred_bbox[3]), \
+                                int(pred_bbox[0]):int(pred_bbox[2])] = curOrg
                 
-        return batch
+        return batch, org_samples
                 
 def build_matcher(args):
     return HungarianMatcher()

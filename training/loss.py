@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch_utils import training_stats
 from torch_utils.ops import upfirdn2d
+import dnnlib
 
 currentdir = os.path.dirname(os.path.abspath(
     inspect.getfile(inspect.currentframe())))
@@ -426,6 +427,144 @@ class ProjectedHungarianLoss(Loss):
     def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, \
                  pixel_wise='L1', is_percept=False, **kwargs) -> None:
         super().__init__()
+        import sys
+        sys.path.insert(0, './yolov7')
+        from yolov7.models.experimental import attempt_load
+        self.device = device
+        self.G = G
+        ckp_object = '/home/ubuntu/run_unet/00022-fastgan_lite-mix-ada-crop_train_256-gpus4-batch144/network-snapshot.pkl'
+        import legacy
+        with dnnlib.util.open_url(ckp_object, verbose=True) as f:
+            network_dict = legacy.load_network_pkl(f)
+            self.G_unet = network_dict['G_ema'].requires_grad_(False).to(device) # subclass of torch.nn.Module
+        self.G_ema = G_ema
+        self.D = D
+        self.blur_init_sigma = blur_init_sigma
+        self.blur_fade_kimg = blur_fade_kimg
+        self.is_fpn = is_fpn
+        self.pixel_wise = pixel_wise
+        self.is_percept = is_percept
+        from training.matching import matching as matchingfn
+        from pg_modules.hungarian import HungarianMatcher
+        self.matcher = HungarianMatcher()
+        self.matchingfn = matchingfn
+        self.k = 10
+        self.detector = attempt_load('yolov7/yolov7.pt', map_location=device)
+        self.detector.eval()
+        self.half = device != 'cpu'
+        if self.half:
+            self.detector.half()
+       
+    def run_G(self, z, c, update_emas=False):
+        ws = self.G.mapping(z, c, update_emas=update_emas)
+        img = self.G.synthesis(ws, c, update_emas=False)
+        return img
+    
+    def run_D(self, img, c, blur_sigma=0, update_emas=False):
+        z_unet = torch.randn([self.k*img.shape[0], self.G_unet.z_dim], device=self.device)
+        
+        with torch.no_grad():
+            objects = self.G_unet(z_unet, c=0)
+        
+        img = self.matchingfn(self.detector, self.matcher, img, objects, self.k, self.half,\
+                              next(self.G.parameters()).device, next(self.G_unet.parameters()).device)
+        blur_size = np.floor(blur_sigma * 3)
+        if blur_size > 0:
+            with torch.autograd.profiler.record_function('blur'):
+                f = torch.arange(-blur_size, blur_size + 1,
+                                 device=img.device).div(blur_sigma).square().neg().exp2()
+                img = upfirdn2d.filter2d(img, f / f.sum())
+
+        logits = self.D(img, c)
+        return logits
+        
+    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg):
+        assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
+        do_Gmain = (phase in ['Gmain', 'Gboth'])
+        do_Dmain = (phase in ['Dmain', 'Dboth'])
+        if phase in ['Dreg', 'Greg']:
+            return  # no regularization needed for PG
+
+        # blurring schedule
+        blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * \
+            self.blur_init_sigma if self.blur_fade_kimg > 1 else 0
+
+        if do_Gmain:
+
+            # Gmain: Maximize logits for generated images.
+            with torch.autograd.profiler.record_function('Gmain_forward'):
+                gen_img = self.run_G(gen_z, gen_c)
+                gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
+                loss_Gmain = (-gen_logits).mean()
+
+                # Logging
+                training_stats.report('Loss/signs/fake', gen_logits.sign())
+                training_stats.report('Loss/G/loss', loss_Gmain)
+
+            with torch.autograd.profiler.record_function('Gmain_backward'):
+                loss_Gmain.backward()
+
+        if do_Dmain:
+
+            # Dmain: Minimize logits for generated images.
+            with torch.autograd.profiler.record_function('Dgen_forward'):
+                gen_img = self.run_G(gen_z, gen_c, update_emas=True)
+                gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
+                loss_Dgen = (F.relu(torch.ones_like(
+                    gen_logits) + gen_logits)).mean()
+
+                if self.is_fpn:
+
+                    real_fts = self.fpn(real_img)
+                    fake_fts = self.fpn(gen_img)
+                    loss_ft = 0
+                    for (real_ft, fake_ft) in zip(real_fts, fake_fts):
+                        loss_ft += self.pixLoss(real_ft, fake_ft).mean()
+
+                    loss_Dgen += loss_ft
+
+                if self.is_percept:
+                    percelt_loss = self.percept(real_img, gen_img).mean()
+                    loss_Dgen += percelt_loss
+
+                # Logging
+                training_stats.report('Loss/scores/fake', gen_logits)
+                training_stats.report('Loss/signs/fake', gen_logits.sign())
+
+
+            with torch.autograd.profiler.record_function('Dgen_backward'):
+                loss_Dgen.backward()
+
+            # Dmain: Maximize logits for real images.
+            with torch.autograd.profiler.record_function('Dreal_forward'):
+                real_img_tmp = real_img.detach().requires_grad_(False)
+                real_logits = self.run_D(
+                    real_img_tmp, real_c, blur_sigma=blur_sigma)
+                loss_Dreal = (F.relu(torch.ones_like(
+                    real_logits) - real_logits)).mean()
+                
+                if self.is_fpn:
+
+                    real_fts = self.fpn(real_img)
+                    fake_fts = self.fpn(gen_img)
+                    loss_ft = 0
+                    for (real_ft, fake_ft) in zip(real_fts, fake_fts):
+                        loss_ft += self.pixLoss(real_ft, fake_ft).mean()
+
+                    loss_Dreal += loss_ft
+
+                if self.is_percept:
+                    percelt_loss = self.percept(real_img, gen_img).mean()
+                    loss_Dreal += percelt_loss
+
+                # Logging
+                training_stats.report('Loss/scores/real', real_logits)
+                training_stats.report('Loss/signs/real', real_logits.sign())
+
+                training_stats.report('Loss/D/loss', loss_Dgen + loss_Dreal)
+
+            with torch.autograd.profiler.record_function('Dreal_backward'):
+                loss_Dreal.backward()
         
 
 class FastGANLoss(Loss):
