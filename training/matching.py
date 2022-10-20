@@ -12,7 +12,7 @@ def matching(model, matcher, samples, objects, k, half, g_device, g_unet_device)
     idx = 0
     for i in range(len(outputs)):
         # print(len(outputs[i]))
-        samples[i, :, :, :] = matcher(new_samples[i], new_objects[idx:idx+k], samples[i], objects[idx:idx+k], outputs[i], g_device, g_unet_device)[0]
+        samples[i, :, :, :] = matcher(new_samples[i], new_objects[idx:idx+k], samples[i], objects[idx:idx+k], outputs[i], g_device, g_unet_device)[1]
         idx += k
         
     return samples

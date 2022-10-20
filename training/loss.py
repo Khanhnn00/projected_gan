@@ -458,9 +458,6 @@ class ProjectedHungarianLoss(Loss):
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
         img = self.G.synthesis(ws, c, update_emas=False)
-        return img
-    
-    def run_D(self, img, c, blur_sigma=0, update_emas=False):
         z_unet = torch.randn([self.k*img.shape[0], self.G_unet.z_dim], device=self.device)
         
         with torch.no_grad():
@@ -468,6 +465,11 @@ class ProjectedHungarianLoss(Loss):
         
         img = self.matchingfn(self.detector, self.matcher, img, objects, self.k, self.half,\
                               next(self.G.parameters()).device, next(self.G_unet.parameters()).device)
+        img = self.G.refine(img)
+        return img
+    
+    def run_D(self, img, c, blur_sigma=0, update_emas=False):
+
         blur_size = np.floor(blur_sigma * 3)
         if blur_size > 0:
             with torch.autograd.profiler.record_function('blur'):

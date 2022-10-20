@@ -30,7 +30,7 @@ from torch_utils import misc
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,3,4'
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,6,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,5,6'
 
 def subprocess_fn(rank, c, temp_dir, opts):
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
@@ -150,7 +150,7 @@ def parse_comma_separated_list(s):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['fastgan', 'fastgan_lite', 'stylegan2', 'unet']), default='stylegan2', required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['fastgan', 'fastgan_lite', 'fastgan_refine', 'stylegan2', 'unet']), default='stylegan2', required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',   type=click.IntRange(min=1), required=True)
@@ -266,9 +266,12 @@ def main(**kwargs):
         c.G_opt_kwargs.lr = 5e-5
         c.D_opt_kwargs.lr = 0.0002
 
-    elif opts.cfg in ['fastgan', 'fastgan_lite']:
-        c.G_kwargs = dnnlib.EasyDict(class_name='pg_modules.networks_fastgan.Generator', cond=opts.cond, synthesis_kwargs=dnnlib.EasyDict())
-        c.G_kwargs.synthesis_kwargs.lite = (opts.cfg == 'fastgan_lite')
+    elif opts.cfg in ['fastgan', 'fastgan_lite', 'fastgan_refine']:
+        if opts.cfg == 'fastgan_refine':
+            c.G_kwargs = dnnlib.EasyDict(class_name='pg_modules.network_fastgan_refine.Generator', cond=opts.cond, synthesis_kwargs=dnnlib.EasyDict())
+        else:
+            c.G_kwargs = dnnlib.EasyDict(class_name='pg_modules.networks_fastgan.Generator', cond=opts.cond, synthesis_kwargs=dnnlib.EasyDict())
+        c.G_kwargs.synthesis_kwargs.lite = (opts.cfg in ['fastgan_lite', 'fastgan_refine'])
         c.G_opt_kwargs.lr = c.D_opt_kwargs.lr = 0.0002
         use_separable_discs = False
 
@@ -298,13 +301,19 @@ def main(**kwargs):
     if opts.dis in ['projected', 'projected_matching']:
         if opts.dis == 'projected':
             c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedGANLoss')
+            c.D_kwargs = dnnlib.EasyDict(
+                class_name='pg_modules.discriminator.ProjectedDiscriminator',
+                diffaug=True,
+                interp224=(c.training_set_kwargs.resolution < 224),
+                backbone_kwargs=dnnlib.EasyDict(),
+        )
         else:
             c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedHungarianLoss')
-        c.D_kwargs = dnnlib.EasyDict(
-            class_name='pg_modules.discriminator.ProjectedDiscriminator',
-            diffaug=True,
-            interp224=(c.training_set_kwargs.resolution < 224),
-            backbone_kwargs=dnnlib.EasyDict(),
+            c.D_kwargs = dnnlib.EasyDict(
+                class_name='pg_modules.discriminator.ProjectedRefineDiscriminator',
+                diffaug=True,
+                interp224=(c.training_set_kwargs.resolution < 224),
+                backbone_kwargs=dnnlib.EasyDict(),
         )
         c.D_kwargs.backbone_kwargs.cout = 64
         c.D_kwargs.backbone_kwargs.expand = True
@@ -345,6 +354,9 @@ def main(**kwargs):
             class_name='pg_modules.discriminator.FastGANDiscriminator'
         )
         # c.D_kwargs.backbone_kwargs.im_size = 256
+    
+    if opts.cfg == 'fastgan_refine':
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.ProjectedHungarianLoss')
     
     # Launch.
     launch_training(c=c, opts=opts, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
