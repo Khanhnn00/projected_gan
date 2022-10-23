@@ -20,7 +20,7 @@ import legacy
 import shutil
 
 import dnnlib
-from training import training_loop, training_loop_unet, training_loop_mix
+from training import training_loop, training_loop_unet, training_loop_mix, training_loop_hungarian
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
@@ -56,6 +56,8 @@ def subprocess_fn(rank, c, temp_dir, opts):
         training_loop_unet.training_loop(rank=rank, **c)
     elif opts.dis == 'mix':
         training_loop_mix.training_loop(rank=rank, **c)
+    elif opts.cfg == 'fastgan_refine':
+        training_loop_hungarian.training_loop(rank=rank, **c)
     else:
         training_loop.training_loop(rank=rank, **c)
 

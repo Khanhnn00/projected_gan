@@ -6,6 +6,9 @@ resize = transforms.Resize(size=(640, 640))
 import cv2
 import numpy as np
 
+import sys
+sys.path.insert(0, 'yolov7')
+
 from yolov7.models.experimental import attempt_load
 from yolov7.utils.general import non_max_suppression, scale_coords
 

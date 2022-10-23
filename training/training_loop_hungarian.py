@@ -28,6 +28,7 @@ from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
+from pg_modules.refiner import UNet
 
 import legacy
 from metrics import metric_main
@@ -205,13 +206,25 @@ def training_loop(
     if rank == 0:
         print('Constructing networks...')
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
-    # G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+    G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().to(device) # subclass of torch.nn.Module
     ckp_object = '/home/ubuntu/runs/00011-fastgan_lite-mix-ada-cityscape_train_256-gpus4-batch144-fpn0-unet0.200000/network-snapshot.pkl'
     with dnnlib.util.open_url(ckp_object, verbose=True) as f:
         network_dict = legacy.load_network_pkl(f)
-        G = network_dict['G_ema'].train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+        G.G_main = network_dict['G_ema'].requires_grad_(False).to(device) # subclass of torch.nn.Module
+    G.requires_grad_(False).to(device)
+    # G.refine.requires_grad_(False)
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
+    G_refine = UNet(3,3).to(device)
+    G_refine_opt_kwarg = {                                                                                                                           
+    "class_name": "torch.optim.Adam",                                                                                                         
+    "betas": [                                                                                                                                
+      0,                                                                                                                                      
+      0.99                                                                                                                                    
+    ],                                                                                                                                        
+    "eps": 1e-08,                                                                                                                             
+    "lr": 0.0002                                                                                                                              
+    }
 
 
     # Resume from existing pickle.
@@ -219,7 +232,7 @@ def training_loop(
         print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
-        for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
+        for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('G_refine', G_refine)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
         # if ckpt_pkl is not None:            # Load ticks
@@ -263,15 +276,16 @@ def training_loop(
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
 
-    for module in [G, D, G_ema, augment_pipe]:
+    for module in [G, D, G_ema, augment_pipe, G_refine]:
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
 
+    G_refine_opt = dnnlib.util.construct_class_by_name(params=G_refine.parameters(), **G_refine_opt_kwarg) # subclass of torch.optim.Optimizer
     # Setup training phases.
     if rank == 0:
         print('Setting up training phases...')
-    loss = dnnlib.util.construct_class_by_name(device=device, G=G, G_ema=G_ema, D=D, **loss_kwargs) # subclass of training.loss.Loss
+    loss = dnnlib.util.construct_class_by_name(device=device, G=G, G_ema=G_ema, D=D, refine=G_refine, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
@@ -318,10 +332,11 @@ def training_loop(
 
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-
+        # imgs = [G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)]
+        images = torch.cat([G_ema(z=z, c=c, noise_mode='const', phase='test').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
-
+        # images = torch.cat([G_refine(G_ema(z=z, c=c, noise_mode='const', phase='test')).cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+        # save_image_grid(images, os.path.join(run_dir, 'fakes_refined_init.png'), drange=[-1,1], grid_size=grid_size)
     # Initialize logs.
     if rank == 0:
         print('Initializing logs...')
@@ -379,6 +394,9 @@ def training_loop(
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
+            if phase.name == 'Gboth':
+                G_refine.requires_grad_(True)
+                G_refine_opt.zero_grad(set_to_none=True)
 
             if phase.name in ['Dmain', 'Dboth', 'Dreg']:
                 try:
@@ -403,6 +421,22 @@ def training_loop(
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
+                
+                if phase.name == 'Gboth':
+                    G_refine.requires_grad_(False)
+                    params = [param for param in G_refine.parameters() if param.grad is not None]
+                    # print('*'*30)
+                    # print(len(params))
+                    if len(params) > 0:
+                        flat = torch.cat([param.grad.flatten() for param in params])
+                        if num_gpus > 1:
+                            torch.distributed.all_reduce(flat)
+                            flat /= num_gpus
+                        misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
+                        grads = flat.split([param.numel() for param in params])
+                        for param, grad in zip(params, grads):
+                            param.grad = grad.reshape(param.shape)
+                    G_refine_opt.step()
 
             # Phase done.
             if phase.end_event is not None:
@@ -473,8 +507,11 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.jpg'), drange=[-1,1], grid_size=grid_size)
+            # imgs = [G_ema(z=z, c=c, noise_mode='const', phase='test') for z, c in zip(grid_z, grid_c)]
+            # images = torch.cat([G_ema(z=z, c=c, noise_mode='const', phase='test').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            # save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.jpg'), drange=[-1,1], grid_size=grid_size)
+            images = torch.cat([G_refine(G_ema(z=z, c=c, noise_mode='const', phase='test')).cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes_refined_{cur_nimg//1000:06d}.jpg'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None
@@ -494,7 +531,7 @@ def training_loop(
         snapshot_data = None
 
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs))
+            snapshot_data = dict(G=G, D=D, G_ema=G_ema, refine=G_refine, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
                 if isinstance(value, torch.nn.Module):
                     snapshot_data[key] = value
@@ -503,6 +540,7 @@ def training_loop(
             
             for phase in phases:
                 snapshot_optim[phase.name] = phase.opt.state_dict()
+            snapshot_optim['G_refine'] = G_refine_opt.state_dict()
             torch.save(snapshot_optim, os.path.join(run_dir, 'optim.pth'))
 
         # Save Checkpoint if needed

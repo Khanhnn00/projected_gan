@@ -5,7 +5,6 @@
 import torch.nn as nn
 from pg_modules.blocks import (DownBlock, InitLayer, UpBlockBig, UpBlockBigCond, UpBlockSmall, UpBlockSmallCond, SEBlock, conv2d)
 
-
 def normalize_second_moment(x, dim=1, eps=1e-8):
     return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
 
@@ -146,28 +145,6 @@ class FastganSynthesisCond(nn.Module):
 
         return self.to_big(feat_last)
 
-class UNet(nn.Module):
-    def __init__(self, in_channel, out_channel):
-        super().__init__()
-        self.in_c = in_channel
-        self.out_c = out_channel
-        self.up1 = UpBlockSmall(in_channel, 64)
-        self.up2 = UpBlockSmall(64, 128)
-        self.down1 = DownBlock(128, 64)
-        self.se = SEBlock(64, out_channel)
-        self.to_big = conv2d(3, out_channel, 3, 1, 1, bias=True)
-        
-    def forward(self, x):
-        x = self.up1(x)
-        x1 = self.up2(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.se(x3, x1)
-        x4 = self.to_big(x4)
-        return x4
-        
-    
-
 class Generator(nn.Module):
     def __init__(
         self,
@@ -192,9 +169,7 @@ class Generator(nn.Module):
         self.mapping = DummyMapping()  # to fit the StyleGAN API
         Synthesis = FastganSynthesisCond if cond else FastganSynthesis
         self.synthesis = Synthesis(ngf=ngf, z_dim=z_dim, nc=img_channels, img_resolution=img_resolution, **synthesis_kwargs)
-        from pg_modules.refiner import UNet
-        self.refine = UNet(3,3)
-        
+
     def forward(self, z, c, **kwargs):
         w = self.mapping(z, c)
         img = self.synthesis(w, c)

@@ -424,19 +424,11 @@ class MixLoss(Loss):
                 total_dreal.backward()
                 
 class ProjectedHungarianLoss(Loss):
-    def __init__(self, device, G, D, G_ema, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, \
+    def __init__(self, device, G, D, G_ema, refine, blur_init_sigma=0, blur_fade_kimg=0, is_fpn=False, \
                  pixel_wise='L1', is_percept=False, **kwargs) -> None:
         super().__init__()
-        import sys
-        sys.path.insert(0, './yolov7')
-        from yolov7.models.experimental import attempt_load
-        self.device = device
+        
         self.G = G
-        ckp_object = '/home/ubuntu/run_unet/00022-fastgan_lite-mix-ada-crop_train_256-gpus4-batch144/network-snapshot.pkl'
-        import legacy
-        with dnnlib.util.open_url(ckp_object, verbose=True) as f:
-            network_dict = legacy.load_network_pkl(f)
-            self.G_unet = network_dict['G_ema'].requires_grad_(False).to(device) # subclass of torch.nn.Module
         self.G_ema = G_ema
         self.D = D
         self.blur_init_sigma = blur_init_sigma
@@ -444,8 +436,18 @@ class ProjectedHungarianLoss(Loss):
         self.is_fpn = is_fpn
         self.pixel_wise = pixel_wise
         self.is_percept = is_percept
+        self.refine = refine
         from training.matching import matching as matchingfn
         from pg_modules.hungarian import HungarianMatcher
+        import sys
+        sys.path.insert(0, './yolov7')
+        from yolov7.models.experimental import attempt_load
+        self.device = device
+        ckp_object = '/home/ubuntu/run_unet/00022-fastgan_lite-mix-ada-crop_train_256-gpus4-batch144/network-snapshot.pkl'
+        import legacy
+        with dnnlib.util.open_url(ckp_object, verbose=True) as f:
+            network_dict = legacy.load_network_pkl(f)
+            self.G_unet = network_dict['G_ema'].requires_grad_(False).to(device) # subclass of torch.nn.Module
         self.matcher = HungarianMatcher()
         self.matchingfn = matchingfn
         self.k = 10
@@ -463,10 +465,15 @@ class ProjectedHungarianLoss(Loss):
         with torch.no_grad():
             objects = self.G_unet(z_unet, c=0)
         
-        img = self.matchingfn(self.detector, self.matcher, img, objects, self.k, self.half,\
-                              next(self.G.parameters()).device, next(self.G_unet.parameters()).device)
-        img = self.G.refine(img)
+        img = self.matchingfn(self.detector, self.matcher, img, objects, self.k,\
+                              next(self.G.parameters()).device)
+        # print('refining ')
+        img = self.refine(img)
         return img
+    
+    # def run_G(self, z, c, update_emas=False):
+    #     img = self.G(z, c)
+    #     return img
     
     def run_D(self, img, c, blur_sigma=0, update_emas=False):
 

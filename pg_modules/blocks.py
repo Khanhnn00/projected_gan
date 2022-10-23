@@ -229,7 +229,6 @@ class DownBlockPatch(nn.Module):
 
 ### CSM
 
-
 class ResidualConvUnit(nn.Module):
     def __init__(self, cin, activation, bn):
         super().__init__()

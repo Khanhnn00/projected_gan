@@ -30,7 +30,7 @@ class HungarianMatcher(nn.Module):
 
 
     @torch.no_grad()
-    def forward(self, batch, targets, org_samples, org_targets, outputs, g_device, g_unet_device):
+    def forward(self, batch, targets, org_samples, org_targets, outputs, g_device):
         """ Performs the matching
 
         Params:
